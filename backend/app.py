@@ -14,14 +14,19 @@ CORS(app, origins=os.getenv("FRONTEND_ORIGIN", "http://localhost:5173"))
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL")
+MAX_MESSAGE_CHARS = 4_000
+MAX_HISTORY_ITEMS = 10
+
+
+class LLMConfigurationError(RuntimeError):
+    """Raised when required provider configuration is missing."""
 
 
 def call_llm(messages: list[dict[str, str]], temperature: float = 0.7) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-
-    if not OPENROUTER_MODEL:
-        raise RuntimeError("OPENROUTER_MODEL is not configured")
+    if not OPENROUTER_API_KEY or not OPENROUTER_MODEL:
+        raise LLMConfigurationError(
+            "Set OPENROUTER_API_KEY and OPENROUTER_MODEL in the backend environment."
+        )
 
     response = requests.post(
         OPENROUTER_URL,
@@ -34,12 +39,19 @@ def call_llm(messages: list[dict[str, str]], temperature: float = 0.7) -> str:
             "messages": messages,
             "temperature": temperature,
         },
-        timeout=60,
+        timeout=30,
     )
     response.raise_for_status()
 
-    data: dict[str, Any] = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    data: Any = response.json()
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("LLM provider returned an unexpected response.")
+    message = choices[0].get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM provider returned an empty response.")
+    return content.strip()
 
 
 def wellness_system_prompt() -> str:
@@ -52,28 +64,50 @@ def wellness_system_prompt() -> str:
     )
 
 
+def provider_error(exc: Exception):
+    app.logger.warning("AI provider request failed: %s", type(exc).__name__)
+    return jsonify({"error": "The AI service could not complete the request. Please try again."}), 502
+
+
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "service": "self-love-backend"})
+    configured = bool(OPENROUTER_API_KEY and OPENROUTER_MODEL)
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "self-love-backend",
+            "ai_configured": configured,
+        }
+    )
 
 
 @app.post("/api/chat")
 def chat():
-    payload = request.get_json(silent=True) or {}
-    message = str(payload.get("message", "")).strip()
-    mood = str(payload.get("mood", "neutral")).strip()
-    history = payload.get("history", [])
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "A JSON object is required."}), 400
 
-    if not message:
-        return jsonify({"error": "message is required"}), 400
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({"error": "message must be a non-empty string."}), 400
+    message = message.strip()
+    if len(message) > MAX_MESSAGE_CHARS:
+        return jsonify({"error": f"message must be at most {MAX_MESSAGE_CHARS} characters."}), 413
 
+    mood_value = payload.get("mood", "neutral")
+    mood = mood_value.strip() if isinstance(mood_value, str) else "neutral"
+    mood = (mood or "neutral")[:80]
+
+    history_value = payload.get("history", [])
+    history = history_value if isinstance(history_value, list) else []
     safe_history = [
-        item
+        {"role": item["role"], "content": item["content"][:MAX_MESSAGE_CHARS]}
         for item in history
         if isinstance(item, dict)
         and item.get("role") in {"user", "assistant"}
         and isinstance(item.get("content"), str)
-    ][-10:]
+        and item["content"].strip()
+    ][-MAX_HISTORY_ITEMS:]
 
     messages = [
         {"role": "system", "content": wellness_system_prompt()},
@@ -81,34 +115,46 @@ def chat():
             "role": "system",
             "content": f"The user's current mood is: {mood}. Adapt your tone accordingly.",
         },
-        *[
-            {"role": item["role"], "content": item["content"]}
-            for item in safe_history
-        ],
+        *safe_history,
         {"role": "user", "content": message},
     ]
 
     try:
-        reply = call_llm(messages)
-        return jsonify({"reply": reply})
-    except requests.HTTPError as exc:
-        return jsonify({"error": f"LLM provider error: {exc}"}), 502
-    except (RuntimeError, KeyError, IndexError, TypeError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"reply": call_llm(messages)})
+    except LLMConfigurationError:
+        return jsonify(
+            {"error": "The AI service is not configured. Set the required backend environment variables."}
+        ), 503
+    except requests.RequestException as exc:
+        return provider_error(exc)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return provider_error(exc)
 
 
 @app.post("/api/story")
 def story():
-    payload = request.get_json(silent=True) or {}
-    theme = str(payload.get("theme", "a peaceful night")).strip()
-    mood = str(payload.get("mood", "calm")).strip()
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "A JSON object is required."}), 400
+
+    theme_value = payload.get("theme", "a peaceful night")
+    mood_value = payload.get("mood", "calm")
+    if not isinstance(theme_value, str) or not isinstance(mood_value, str):
+        return jsonify({"error": "theme and mood must be strings."}), 400
+
+    theme = theme_value.strip() or "a peaceful night"
+    mood = mood_value.strip() or "calm"
+    if len(theme) > 200 or len(mood) > 80:
+        return jsonify({"error": "theme must be at most 200 characters and mood at most 80."}), 400
 
     messages = [
         {"role": "system", "content": wellness_system_prompt()},
         {
             "role": "user",
             "content": (
-                f"Write a gentle bedtime story in 250 words or less. "
+                "Write a gentle bedtime story in 250 words or less. "
                 f"Theme: {theme}. Desired mood: {mood}. "
                 "Keep it comforting, simple, and suitable for winding down."
             ),
@@ -116,13 +162,20 @@ def story():
     ]
 
     try:
-        reply = call_llm(messages, temperature=0.8)
-        return jsonify({"story": reply})
-    except requests.HTTPError as exc:
-        return jsonify({"error": f"LLM provider error: {exc}"}), 502
-    except (RuntimeError, KeyError, IndexError, TypeError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"story": call_llm(messages, temperature=0.8)})
+    except LLMConfigurationError:
+        return jsonify(
+            {"error": "The AI service is not configured. Set the required backend environment variables."}
+        ), 503
+    except requests.RequestException as exc:
+        return provider_error(exc)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return provider_error(exc)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+    )
