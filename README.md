@@ -188,6 +188,18 @@ My contribution focused on the AI application layer and integration:
 - Added voice interaction and mood-driven wellness features.
 - Tested the end-to-end flow across different user inputs and conversation states.
 
+## 🧪 Backend tests
+
+From the repository root:
+
+```bash
+cd backend
+python -m pip install -r requirements.txt pytest
+pytest -q
+```
+
+The GitHub Actions workflow compiles the Flask backend, runs the backend API tests, and builds the frontend. A passing CI run verifies those automated checks only; provider-backed chat/story behavior still requires a valid OpenRouter key and an end-to-end smoke test.
+
 ## ⚠️ Scope & Safety
 
 This project is a **wellness companion prototype**, not a medical or mental-health diagnostic system. It should not be used as a substitute for qualified professional care or emergency services.
