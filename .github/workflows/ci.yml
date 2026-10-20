@@ -15,9 +15,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install -r backend/requirements.txt
+        run: pip install -r backend/requirements.txt pytest
       - name: Compile Python
         run: python -m py_compile backend/app.py
+      - name: Test API
+        working-directory: backend
+        run: pytest -q
 
   frontend:
     runs-on: ubuntu-latest
